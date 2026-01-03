@@ -1,0 +1,10 @@
+{
+    "manifest_version": 1,
+    "name": "GitHub 监控插件",
+    "version": "1.0.0",
+    "description": "定期扫描 GitHub 仓库新提交并推送到群聊",
+    "author": {
+        "name": "Jasdew Starfield"
+    },
+    "license": "MIT"
+}
