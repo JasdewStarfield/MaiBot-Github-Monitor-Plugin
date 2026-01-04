@@ -298,7 +298,7 @@ class GitHubMonitorPlugin(BasePlugin):
 
                     if success and llm_response:
                         # llm_data.content 包含原始生成的文本
-                        ai_comment = llm_response
+                        ai_comment = llm_response.content
                         self.logger.info(f"[{self.plugin_name}] 为 {repo_name} 的更新生成了评价: {ai_comment}...")
 
                 except Exception as e:
@@ -310,7 +310,7 @@ class GitHubMonitorPlugin(BasePlugin):
                     await send_api.text_to_stream(
                         text=ai_comment,
                         stream_id=stream.stream_id,
-                        typing=True,
+                        typing=False,
                         storage_message=True
                     )
             except Exception as e:
