@@ -284,25 +284,21 @@ class GitHubMonitorPlugin(BasePlugin):
                         f"检测到 GitHub 仓库 {repo_name} 有新的代码提交。\n"
                         f"提交者: {author}\n"
                         f"提交信息:\n"
-                        f"{message}\n"
-                        f"\n"
-                        f"请根据提交信息用简短、有趣的风格评价一下这个提交。"
+                        f"{message}"
                     )
 
                     # 调用生成器 API
                     # generate_reply 优先使用 chat_stream
-                    success, llm_data = await generator_api.generate_reply(
+                    success, llm_response = await generator_api.rewrite_reply(
                         chat_stream=stream,
-                        extra_info=extra_context,
-                        reply_reason="评价最新的 GitHub Commit",
-                        think_level=1,
-                        from_plugin=True,
-                        enable_tool=False
+                        raw_reply=extra_context,
+                        reason="请根据提交信息用简短、有趣的风格评价一下这个提交。",
+                        enable_chinese_typo=False
                     )
 
-                    if success and llm_data and llm_data.content:
+                    if success and llm_response:
                         # llm_data.content 包含原始生成的文本
-                        ai_comment = llm_data.content
+                        ai_comment = llm_response
                         self.logger.info(f"[{self.plugin_name}] 为 {repo_name} 的更新生成了评价: {ai_comment[:20]}...")
 
                 except Exception as e:
