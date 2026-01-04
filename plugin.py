@@ -6,7 +6,9 @@ from typing import List, Tuple, Type, Dict
 # 导入基础组件
 from src.plugin_system import BasePlugin, register_plugin, ComponentInfo, ConfigField
 
-from src.plugin_system.apis import send_api, chat_api
+from src.plugin_system.apis import send_api, chat_api, generator_api
+
+PLUGIN_CONFIG_VERSION = "1.1.2"
 
 @register_plugin
 class GitHubMonitorPlugin(BasePlugin):
@@ -30,7 +32,7 @@ class GitHubMonitorPlugin(BasePlugin):
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.1.1",
+                default=PLUGIN_CONFIG_VERSION,
                 description="配置文件版本号，请勿修改！",
                 disabled=True
             ),
@@ -48,6 +50,11 @@ class GitHubMonitorPlugin(BasePlugin):
                 default=60,
                 min=10,
                 description="轮询间隔 (秒)"
+            ),
+            "enable_commentary": ConfigField(
+                type=bool,
+                default=True,
+                description="启用 AI 锐评；开启后，Bot 将根据 Commit 内容自动生成一句评论"
             ),
         },
         "monitor": {
@@ -229,35 +236,89 @@ class GitHubMonitorPlugin(BasePlugin):
         author = commit_item['commit']['author']['name']
         message = commit_item['commit']['message']
 
-        msg_text = (
+        base_msg = (
             f"📢 [{repo_name}] 检测到新提交！\n"
             f"Commit sha: {sha}\n"
             f"提交者: {author}\n"
-            f"简介:"
+            f"简介:\n"
             f"{message}"
         )
 
         subscribers = self.get_config("monitor.subscribers", [])
+        enable_ai = self.get_config("monitor.enable_commentary", True)
+
+        if not subscribers:
+            return
 
         for sub in subscribers:
             group_id = sub.get("group_id")
             platform = sub.get("platform", "qq")
 
+            if not group_id:
+                continue
+
             stream = chat_api.get_stream_by_group_id(group_id=str(group_id), platform=platform)
+
+            if not stream:
+                self.logger.warning(f"[{self.plugin_name}] 找不到聊天流: {group_id}")
+                continue
             
-            if stream:
+            try:
+                await send_api.text_to_stream(
+                    text=base_msg,
+                    stream_id=stream.stream_id,
+                    typing=False,
+                    storage_message=True
+                )
+                self.logger.info(f"[{self.plugin_name}] 已广播更新 [{repo_name}] -> 群 {group_id}")
+            except Exception as e:
+                self.logger.error(f"[{self.plugin_name}] 发送消息到群 {group_id} 失败: {e}")
+
+            ai_comment = ""
+            
+            if enable_ai:
                 try:
+                    # 构建给 Bot 的上下文信息
+                    # 我们告诉 Bot 这是一个 GitHub 提交，让它进行评价
+                    extra_context = (
+                        f"检测到 GitHub 仓库 {repo_name} 有新的代码提交。\n"
+                        f"提交者: {author}\n"
+                        f"提交信息:\n"
+                        f"{message}\n"
+                        f"\n"
+                        f"请根据提交信息用简短、有趣的风格评价一下这个提交。"
+                    )
+
+                    # 调用生成器 API
+                    # generate_reply 优先使用 chat_stream
+                    success, llm_data = await generator_api.generate_reply(
+                        chat_stream=stream,
+                        extra_info=extra_context,
+                        reply_reason="评价最新的 GitHub Commit",
+                        think_level=1,
+                        from_plugin=True,
+                        enable_tool=False
+                    )
+
+                    if success and llm_data and llm_data.content:
+                        # llm_data.content 包含原始生成的文本
+                        ai_comment = llm_data.content
+                        self.logger.info(f"[{self.plugin_name}] 为 {repo_name} 的更新生成了评价: {ai_comment[:20]}...")
+
+                except Exception as e:
+                    self.logger.error(f"[{self.plugin_name}] AI Generation Failed: {e}")
+                    # 如果生成失败，仅发送基础消息，不中断流程
+                    pass
+            try:
+                if ai_comment != "":
                     await send_api.text_to_stream(
-                        text=msg_text,
+                        text=ai_comment,
                         stream_id=stream.stream_id,
-                        typing=False,
+                        typing=True,
                         storage_message=True
                     )
-                    self.logger.info(f"[{self.plugin_name}] 已广播更新 [{repo_name}] -> 群 {group_id}")
-                except Exception as e:
-                    self.logger.error(f"[{self.plugin_name}] 推送失败 Group({group_id}): {e}")
-            else:
-                self.logger.warning(f"[{self.plugin_name}] 找不到群组流: {group_id} (平台: {platform})")
+            except Exception as e:
+                self.logger.error(f"[{self.plugin_name}] 发送消息到群 {group_id} 失败: {e}")
 
     def __del__(self):
         # 插件卸载时取消任务
