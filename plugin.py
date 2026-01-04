@@ -57,18 +57,20 @@ class GitHubMonitorPlugin(BasePlugin):
                 item_fields={
                     "owner": ConfigField(
                         type=str, 
+                        default="", 
                         required=True, 
-                        lable="仓库拥有者 (Owner)"
+                        description="仓库拥有者 (Owner)"
                     ),
                     "repo": ConfigField(
                         type=str, 
+                        default="", 
                         required=True, 
-                        lable="仓库名称 (Repo)"
+                        description="仓库名称 (Repo)"
                     ),
                     "branch": ConfigField(
                         type=str, 
                         default="master", 
-                        lable="分支 (Branch)"
+                        description="分支 (Branch)"
                     )
                 },
                 default=[
@@ -83,13 +85,14 @@ class GitHubMonitorPlugin(BasePlugin):
                 item_fields={
                     "group_id": ConfigField(
                         type=str, 
+                        default="114514", 
                         required=True, 
-                        lable="群ID"
+                        description="群ID"
                     ),
                     "platform": ConfigField(
                         type=str, 
                         default="qq", 
-                        lable="所属平台"
+                        description="所属平台"
                     )
                 },
                 default=[
