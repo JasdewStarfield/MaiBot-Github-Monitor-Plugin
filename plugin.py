@@ -5,7 +5,6 @@ from typing import List, Tuple, Type, Dict
 
 # 导入基础组件
 from src.plugin_system import BasePlugin, register_plugin, ComponentInfo, ConfigField
-from src.plugin_system.base.config_types import ConfigSection
 
 from src.plugin_system.apis import send_api, chat_api
 
@@ -31,8 +30,9 @@ class GitHubMonitorPlugin(BasePlugin):
             ),
             "config_version": ConfigField(
                 type=str,
-                default="1.1.0",
-                description="配置文件版本号，请勿修改！"
+                default="1.1.1",
+                description="配置文件版本号，请勿修改！",
+                disabled=True
             ),
         },
         "global": {
@@ -40,28 +40,61 @@ class GitHubMonitorPlugin(BasePlugin):
                 type=str,
                 default="",
                 description="GitHub Token，选填；建议填写以提高 API 限额 (5000次/小时)",
+                input_type="password",
                 required=False
             ),
             "interval": ConfigField(
                 type=int,
                 default=60,
+                min=10,
                 description="轮询间隔 (秒)"
             ),
         },
         "monitor": {
             "repositories": ConfigField(
-                type=list, 
+                type=list,
+                item_type="object",
+                item_fields={
+                    "owner": ConfigField(
+                        type=str, 
+                        required=True, 
+                        lable="仓库拥有者 (Owner)"
+                    ),
+                    "repo": ConfigField(
+                        type=str, 
+                        required=True, 
+                        lable="仓库名称 (Repo)"
+                    ),
+                    "branch": ConfigField(
+                        type=str, 
+                        default="master", 
+                        lable="分支 (Branch)"
+                    )
+                },
                 default=[
                     {"owner": "torvalds", "repo": "linux", "branch": "master"},
                     {"owner": "python", "repo": "cpython", "branch": "main"}
                 ],
-                description="监控的仓库列表 (包含 owner, repo, branch)"
+                description="监控的仓库列表"
             ),
             "subscribers": ConfigField(
                 type=list,
+                item_type="object",
+                item_fields={
+                    "group_id": ConfigField(
+                        type=str, 
+                        required=True, 
+                        lable="群ID"
+                    ),
+                    "platform": ConfigField(
+                        type=str, 
+                        default="qq", 
+                        lable="所属平台"
+                    )
+                },
                 default=[
                     {"group_id": "12345678", "platform": "qq"},
-                    {"group_id": "87654321", "platform": "qq"}
+                    {"group_id": "87654321", "platform": "wechat"}
                 ],
                 description="接收通知的群组列表 (包含 group_id, platform)"
             ),
