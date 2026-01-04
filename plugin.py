@@ -299,7 +299,7 @@ class GitHubMonitorPlugin(BasePlugin):
                     if success and llm_response:
                         # llm_data.content 包含原始生成的文本
                         ai_comment = llm_response
-                        self.logger.info(f"[{self.plugin_name}] 为 {repo_name} 的更新生成了评价: {ai_comment[:20]}...")
+                        self.logger.info(f"[{self.plugin_name}] 为 {repo_name} 的更新生成了评价: {ai_comment}...")
 
                 except Exception as e:
                     self.logger.error(f"[{self.plugin_name}] AI Generation Failed: {e}")
