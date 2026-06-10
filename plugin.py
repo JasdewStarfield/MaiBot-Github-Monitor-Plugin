@@ -1,322 +1,429 @@
+"""MaiBot GitHub 仓库监控插件。
+
+定期轮询指定仓库分支上的最新提交，并把提交通知广播到配置好的群聊中。
+在开启点评功能时，插件会先发送一条固定通知，再触发 Maisaka 基于当前上下文补一句简短点评。
+"""
+
+from __future__ import annotations
+
 import asyncio
+import contextlib
+from typing import Any, ClassVar
+
 import aiohttp
-import logging
-from typing import List, Tuple, Type, Dict
 
-# 导入基础组件
-from src.plugin_system import BasePlugin, register_plugin, ComponentInfo, ConfigField
+from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Field, MaiBotPlugin, PluginConfigBase
 
-from src.plugin_system.apis import send_api, chat_api, generator_api
+PLUGIN_CONFIG_VERSION = "2.0.0"
+GITHUB_API_VERSION = "2022-11-28"
+REQUEST_TIMEOUT_SECONDS = 15
 
-PLUGIN_CONFIG_VERSION = "1.1.2"
 
-@register_plugin
-class GitHubMonitorPlugin(BasePlugin):
-    """GitHub 仓库监控插件 - 定期扫描新 Commit 并通知"""
+class PluginSectionConfig(PluginConfigBase):
+    """插件基础配置。"""
 
-    # --- 插件基础信息 ---
-    plugin_name = "github_monitor_plugin"
-    enable_plugin = True
-    dependencies = []
-    # 声明依赖 aiohttp，确保环境中有安装 (pip install aiohttp)
-    python_dependencies = ["aiohttp"] 
-    config_file_name = "config.toml"
+    __ui_label__: ClassVar[str] = "插件"
 
-    # --- 配置 Schema (自动生成配置文件) ---
-    config_schema = {
-        "plugin": {
-            "enable": ConfigField(
-                type=bool,
-                default=True,
-                description="是否启用监控；关闭则本插件无效"
-            ),
-            "config_version": ConfigField(
-                type=str,
-                default=PLUGIN_CONFIG_VERSION,
-                description="配置文件版本号，请勿修改！",
-                disabled=True
-            ),
-        },
-        "global": {
-            "token": ConfigField(
-                type=str,
-                default="",
-                description="GitHub Token，选填；建议填写以提高 API 限额 (5000次/小时)",
-                input_type="password",
-                required=False
-            ),
-            "interval": ConfigField(
-                type=int,
-                default=60,
-                min=10,
-                description="轮询间隔 (秒)"
-            ),
-            "enable_commentary": ConfigField(
-                type=bool,
-                default=True,
-                description="启用 AI 锐评；开启后，Bot 将根据 Commit 内容自动生成一句评论"
-            ),
-        },
-        "monitor": {
-            "repositories": ConfigField(
-                type=list,
-                item_type="object",
-                item_fields={
-                    "owner": ConfigField(
-                        type=str, 
-                        default="", 
-                        required=True, 
-                        description="仓库拥有者 (Owner)"
-                    ),
-                    "repo": ConfigField(
-                        type=str, 
-                        default="", 
-                        required=True, 
-                        description="仓库名称 (Repo)"
-                    ),
-                    "branch": ConfigField(
-                        type=str, 
-                        default="master", 
-                        description="分支 (Branch)"
-                    )
-                },
-                default=[
-                    {"owner": "torvalds", "repo": "linux", "branch": "master"},
-                    {"owner": "python", "repo": "cpython", "branch": "main"}
-                ],
-                description="监控的仓库列表"
-            ),
-            "subscribers": ConfigField(
-                type=list,
-                item_type="object",
-                item_fields={
-                    "group_id": ConfigField(
-                        type=str, 
-                        default="114514", 
-                        required=True, 
-                        description="群ID"
-                    ),
-                    "platform": ConfigField(
-                        type=str, 
-                        default="qq", 
-                        description="所属平台"
-                    )
-                },
-                default=[
-                    {"group_id": "12345678", "platform": "qq"},
-                    {"group_id": "87654321", "platform": "wechat"}
-                ],
-                description="接收通知的群组列表 (包含 group_id, platform)"
-            ),
-        }
-    }
+    enable: bool = Field(default=True, description="是否启用 GitHub 监控插件")
+    config_version: str = Field(default=PLUGIN_CONFIG_VERSION, description="配置版本号")
 
-    # --- 配置分节元数据 ---
-    config_section_descriptions = {
-        "plugin": "插件属性",
-        "global": "全局设置",
-        "monitor": "监控任务",
-    }
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.monitor_task = None
-        self.logger = logging.getLogger(self.plugin_name)
+class GlobalSectionConfig(PluginConfigBase):
+    """全局运行配置。"""
 
-        self.repo_states: Dict[str, str] = {}
+    __ui_label__: ClassVar[str] = "全局设置"
 
-        if not self.get_config("plugin.enable", True):
-            self.logger.info(f"[{self.plugin_name}] GitHub 监控插件未启用，跳过启动监控任务。")
+    token: str = Field(
+        default="",
+        description="GitHub Token，可选；填写后可以提高 GitHub API 速率限制",
+        json_schema_extra={"placeholder": "ghp_xxx 或 github_pat_xxx"},
+    )
+    interval: int = Field(default=60, ge=10, description="轮询间隔（秒）")
+    enable_commentary: bool = Field(
+        default=True,
+        description="是否让 Maisaka 在通知后补一句简短点评",
+    )
+
+
+class RepositoryConfig(PluginConfigBase):
+    """单个仓库监控项。"""
+
+    owner: str = Field(default="", description="仓库拥有者")
+    repo: str = Field(default="", description="仓库名")
+    branch: str = Field(default="main", description="监控的分支名")
+
+
+class SubscriberConfig(PluginConfigBase):
+    """单个通知目标。"""
+
+    group_id: str = Field(default="", description="接收通知的群 ID")
+    platform: str = Field(default="qq", description="群所属的平台")
+
+
+class MonitorSectionConfig(PluginConfigBase):
+    """监控目标与订阅者配置。"""
+
+    __ui_label__: ClassVar[str] = "监控任务"
+
+    repositories: list[RepositoryConfig] = Field(default_factory=list, description="需要监控的仓库列表")
+    subscribers: list[SubscriberConfig] = Field(default_factory=list, description="接收通知的群列表")
+
+
+class GitHubMonitorConfig(PluginConfigBase):
+    """插件完整配置。"""
+
+    plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
+    global_: GlobalSectionConfig = Field(
+        default_factory=GlobalSectionConfig,
+        alias="global",
+        validation_alias="global",
+        serialization_alias="global",
+        description="全局配置",
+        json_schema_extra={"group": "global"},
+    )
+    monitor: MonitorSectionConfig = Field(default_factory=MonitorSectionConfig)
+
+
+class GitHubMonitorPlugin(MaiBotPlugin):
+    """定期检查 GitHub 提交并广播到群聊。"""
+
+    config_model = GitHubMonitorConfig
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._session: aiohttp.ClientSession | None = None
+        self._monitor_task: asyncio.Task[None] | None = None
+        # 记录每个仓库分支最近一次看到的提交 SHA，避免首次加载时把历史提交全部重发。
+        self._repo_states: dict[str, str] = {}
+
+    async def on_load(self) -> None:
+        """插件加载后按当前配置启动后台轮询任务。"""
+        await self._sync_monitor_task()
+
+    async def on_unload(self) -> None:
+        """插件卸载时停止后台任务并关闭 HTTP 会话。"""
+        await self._stop_monitor_task()
+
+    async def on_config_update(self, scope: str, config_data: dict[str, object], version: str) -> None:
+        """配置热重载后同步后台任务状态。"""
+        del config_data
+
+        if scope == CONFIG_RELOAD_SCOPE_SELF:
+            self.ctx.logger.info("GitHub 监控插件配置已更新，version=%s", version)
+            await self._sync_monitor_task()
+
+    async def _sync_monitor_task(self) -> None:
+        """根据启用状态启动或停止监控任务。"""
+        if self.config.plugin.enable:
+            await self._ensure_monitor_task()
+            self.ctx.logger.info("GitHub 监控插件已启用")
             return
 
-        # 启动后台监控任务
-        self.monitor_task = asyncio.create_task(self.monitor_loop())
+        await self._stop_monitor_task()
+        self.ctx.logger.info("GitHub 监控插件当前处于停用状态")
 
-    def get_plugin_components(self) -> List[Tuple[ComponentInfo, Type]]:
-        # 此插件主要靠后台任务运行，没有注册额外的 Action 或 Command 组件
-        return []
+    async def _ensure_monitor_task(self) -> None:
+        """确保轮询任务与 HTTP 会话已经就绪。"""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+            self._session = aiohttp.ClientSession(timeout=timeout)
 
-    async def get_latest_commits(self, session, owner, repo, branch, token):
-        """获取 GitHub Commit"""
-        url = f"https://api.github.com/repos/{owner}/{repo}/commits?sha={branch}"
-        headers = {"Accept": "application/vnd.github.v3+json"}
-        if token:
-            headers["Authorization"] = f"token {token}"
-        
-        try:
-            async with session.get(url, headers=headers, timeout=10) as response:
-                if response.status == 200:
-                    self.logger.debug(f"[{self.plugin_name}] 成功获取 {owner}/{repo} 最新commit")
-                    return await response.json()
-                elif response.status == 403:
-                    self.logger.warning(f"[{self.plugin_name}] GitHub API 速率限制或无权访问 {owner}/{repo} (Status 403)。请检查 Token。")
-                    return None
-                elif response.status == 404:
-                    self.logger.error(f"[{self.plugin_name}] 仓库不存在: {owner}/{repo}/{branch}")
-                    return None
-                else:
-                    self.logger.error(f"[{self.plugin_name}] GitHub API Error {response.status}: {owner}/{repo}")
-                    return None
-        except Exception as e:
-            self.logger.error(f"[{self.plugin_name}] 网络请求失败 {owner}/{repo}: {e}")
-            return None
+        if self._monitor_task is None or self._monitor_task.done():
+            self._monitor_task = asyncio.create_task(self._monitor_loop(), name="github-monitor-loop")
 
-    async def monitor_loop(self):
-        """主监控循环"""
-        self.logger.info(f"[{self.plugin_name}] GitHub 监控任务已启动... 10秒后开始获取Commit")
-        
-        # 等待几秒确保配置已加载且 Bot 就绪
+    async def _stop_monitor_task(self) -> None:
+        """停止轮询任务，并清理网络资源。"""
+        task = self._monitor_task
+        self._monitor_task = None
+
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
+
+    async def _monitor_loop(self) -> None:
+        """后台轮询 GitHub 提交。"""
+        self.ctx.logger.info("GitHub 监控任务已启动，10 秒后开始首次轮询")
         await asyncio.sleep(10)
-        
-        async with aiohttp.ClientSession() as session:
-            while True:
-                interval = self.get_config("global.interval", 60)
-                token = self.get_config("global.token", "")
-                repos = self.get_config("monitor.repositories", [])
 
-                if not repos:
-                    # 如果没有配置任务，待机
-                    self.logger.warning(f"[{self.plugin_name}] 未配置任何仓库，等待配置...")
-                    await asyncio.sleep(interval)
-                    continue
-                
-                for repo_conf in repos:
-                    # 安全获取字段
-                    owner = repo_conf.get("owner")
-                    repo_name = repo_conf.get("repo")
-                    branch = repo_conf.get("branch", "master")
+        while True:
+            interval = max(self.config.global_.interval, 10)
+            repositories = list(self.config.monitor.repositories)
 
-                    if not owner or not repo_name:
-                        continue
-
-                    # 生成唯一标识符 Key
-                    repo_key = f"{owner}/{repo_name}/{branch}"
-
-                    commits = await self.get_latest_commits(session, owner, repo_name, branch, token)
-                    if not commits or not isinstance(commits, list) or len(commits) == 0:
-                        continue
-
-                    current_latest_sha = commits[0]['sha']
-
-                    if repo_key not in self.repo_states:
-                        # 第一次扫描到该仓库 -> 初始化状态，不发送通知
-                        self.repo_states[repo_key] = current_latest_sha
-                        self.logger.info(f"[{self.plugin_name}] 监控初始化: {repo_key} -> {current_latest_sha[:7]}")
-
-                    elif current_latest_sha != self.repo_states[repo_key]:
-                        # 发现更新
-                        last_sha = self.repo_states[repo_key]
-                        new_items = []
-                        i = 0
-                        for commit in commits:
-                            if commit['sha'] == last_sha:
-                                break
-                            new_items.append(commit)
-                            i += 1
-
-                        self.logger.debug(f"[{self.plugin_name}] {repo_key} 发现 {i} 个新 Commit")
-                        
-                        self.repo_states[repo_key] = current_latest_sha
-
-                        # 发送通知 (倒序: 旧 -> 新)
-                        for item in reversed(new_items):
-                            await self.broadcast_notification(item, repo_name, branch)
-                            await asyncio.sleep(1)  # 避免短时间内发送过多消息
-                    else:
-                        self.logger.debug(f"[{self.plugin_name}] {repo_key} 无新 Commit")
-                    
-                    await asyncio.sleep(1)
-
-                # 轮询间隔
+            if not repositories:
+                self.ctx.logger.warning("未配置任何 GitHub 仓库，等待下一次轮询")
                 await asyncio.sleep(interval)
+                continue
 
-    async def broadcast_notification(self, commit_item, repo_name, branch):
-        """广播通知到所有指定群"""
-        sha = commit_item['sha'][:7]
-        author = commit_item['commit']['author']['name']
-        message = commit_item['commit']['message']
+            for repository in repositories:
+                await self._poll_repository(repository)
+                await asyncio.sleep(1)
 
-        base_msg = (
-            f"📢 [{repo_name}] 检测到新提交！\n"
-            f"Commit sha: {sha}\n"
-            f"提交者: {author}\n"
-            f"简介:\n"
-            f"{message}"
+            await asyncio.sleep(interval)
+
+    async def _poll_repository(self, repository: RepositoryConfig) -> None:
+        """轮询单个仓库，并在有新提交时发送通知。"""
+        owner = repository.owner.strip()
+        repo_name = repository.repo.strip()
+        branch = repository.branch.strip() or "main"
+
+        if not owner or not repo_name:
+            return
+
+        commits = await self._fetch_latest_commits(owner=owner, repo=repo_name, branch=branch)
+        if not commits:
+            return
+
+        repo_key = f"{owner}/{repo_name}/{branch}"
+        current_latest_sha = str(commits[0].get("sha") or "").strip()
+        if not current_latest_sha:
+            return
+
+        last_seen_sha = self._repo_states.get(repo_key)
+        if last_seen_sha is None:
+            self._repo_states[repo_key] = current_latest_sha
+            self.ctx.logger.info("初始化监控状态：%s -> %s", repo_key, current_latest_sha[:7])
+            return
+
+        if current_latest_sha == last_seen_sha:
+            self.ctx.logger.debug("%s 无新提交", repo_key)
+            return
+
+        new_commits: list[dict[str, Any]] = []
+        previous_sha_found = False
+        for commit in commits:
+            commit_sha = str(commit.get("sha") or "").strip()
+            if commit_sha == last_seen_sha:
+                previous_sha_found = True
+                break
+            new_commits.append(commit)
+
+        # 如果旧 SHA 不在当前结果页里，说明提交跨距过大或历史被重写。
+        # 这里退化为只通知最新一条，避免一次性刷屏。
+        if not previous_sha_found and new_commits:
+            self.ctx.logger.warning("%s 的历史基线未命中，本次仅广播最新一条提交", repo_key)
+            new_commits = [new_commits[0]]
+
+        self._repo_states[repo_key] = current_latest_sha
+        self.ctx.logger.info("%s 检测到 %d 条新提交", repo_key, len(new_commits))
+
+        for commit in reversed(new_commits):
+            await self._broadcast_notification(commit_item=commit, repo_name=repo_name, branch=branch)
+            await asyncio.sleep(1)
+
+    async def _fetch_latest_commits(self, owner: str, repo: str, branch: str) -> list[dict[str, Any]]:
+        """读取指定仓库分支的最新提交列表。"""
+        if self._session is None:
+            return []
+
+        url = f"https://api.github.com/repos/{owner}/{repo}/commits?sha={branch}"
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "MaiBot-GitHub-Monitor-Plugin",
+            "X-GitHub-Api-Version": GITHUB_API_VERSION,
+        }
+
+        token = self.config.global_.token.strip()
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+
+        try:
+            async with self._session.get(url, headers=headers) as response:
+                if response.status == 200:
+                    payload = await response.json()
+                    if isinstance(payload, list):
+                        return payload
+                    self.ctx.logger.warning("GitHub API 返回了非列表数据：%s/%s", owner, repo)
+                    return []
+
+                if response.status == 403:
+                    self.ctx.logger.warning(
+                        "GitHub API 访问受限：%s/%s（可能是速率限制或 Token 权限不足）",
+                        owner,
+                        repo,
+                    )
+                    return []
+
+                if response.status == 404:
+                    self.ctx.logger.error("仓库或分支不存在：%s/%s@%s", owner, repo, branch)
+                    return []
+
+                error_text = await response.text()
+                self.ctx.logger.error(
+                    "GitHub API 请求失败：%s/%s -> HTTP %s, body=%s",
+                    owner,
+                    repo,
+                    response.status,
+                    error_text,
+                )
+                return []
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.error("获取 GitHub 提交失败：%s/%s -> %s", owner, repo, exc, exc_info=True)
+            return []
+
+    async def _broadcast_notification(self, commit_item: dict[str, Any], repo_name: str, branch: str) -> None:
+        """把新提交广播到所有已配置的订阅群。"""
+        subscribers = list(self.config.monitor.subscribers)
+        if not subscribers:
+            self.ctx.logger.warning("没有配置任何订阅群，跳过本次 GitHub 提交通知")
+            return
+
+        sha = str(commit_item.get("sha") or "")[:7]
+        commit_block = commit_item.get("commit") or {}
+        author_block = commit_block.get("author") or {}
+        author = str(author_block.get("name") or "unknown")
+        message = str(commit_block.get("message") or "").strip()
+        commit_url = str(commit_item.get("html_url") or "").strip()
+        base_message = self._build_commit_notification_message(
+            repo_name=repo_name,
+            branch=branch,
+            sha=sha,
+            author=author,
+            message=message,
+            commit_url=commit_url,
         )
 
-        subscribers = self.get_config("monitor.subscribers", [])
-        enable_ai = self.get_config("monitor.enable_commentary", True)
-
-        if not subscribers:
-            return
-
-        for sub in subscribers:
-            group_id = sub.get("group_id")
-            platform = sub.get("platform", "qq")
-
+        for subscriber in subscribers:
+            group_id = subscriber.group_id.strip()
+            platform = subscriber.platform.strip() or "qq"
             if not group_id:
                 continue
 
-            stream = chat_api.get_stream_by_group_id(group_id=str(group_id), platform=platform)
-
+            stream = await self.ctx.chat.get_stream_by_group_id(group_id=group_id, platform=platform)
             if not stream:
-                self.logger.warning(f"[{self.plugin_name}] 找不到聊天流: {group_id}")
+                self.ctx.logger.warning("未找到订阅群对应的聊天流：platform=%s group_id=%s", platform, group_id)
                 continue
-            
-            try:
-                await send_api.text_to_stream(
-                    text=base_msg,
-                    stream_id=stream.stream_id,
-                    typing=False,
-                    storage_message=True
+
+            stream_id = str(stream.get("stream_id") or "").strip()
+            if not stream_id:
+                self.ctx.logger.warning("聊天流缺少 stream_id：platform=%s group_id=%s", platform, group_id)
+                continue
+
+            # 显式把通知写入 Maisaka 历史，这样后续的点评就能直接参考刚发出去的播报内容。
+            sent = await self.ctx.send.text(
+                base_message,
+                stream_id,
+                sync_to_maisaka_history=True,
+                maisaka_source_kind="plugin:github_monitor:notification",
+            )
+            if not sent:
+                self.ctx.logger.error("基础提交通知发送失败：platform=%s group_id=%s", platform, group_id)
+                continue
+
+            self.ctx.logger.info("已推送 GitHub 提交通知：[%s] -> %s/%s", repo_name, platform, group_id)
+
+            if self.config.global_.enable_commentary:
+                await self._trigger_maisaka_commentary(
+                    stream_id=stream_id,
+                    repo_name=repo_name,
+                    branch=branch,
+                    sha=sha,
+                    author=author,
+                    message=message,
+                    group_id=group_id,
+                    platform=platform,
                 )
-                self.logger.info(f"[{self.plugin_name}] 已广播更新 [{repo_name}] -> 群 {group_id}")
-            except Exception as e:
-                self.logger.error(f"[{self.plugin_name}] 发送消息到群 {group_id} 失败: {e}")
 
-            ai_comment = ""
-            
-            if enable_ai:
-                try:
-                    # 构建给 Bot 的上下文信息
-                    # 我们告诉 Bot 这是一个 GitHub 提交，让它进行评价
-                    extra_context = (
-                        f"检测到 GitHub 仓库 {repo_name} 有新的代码提交。\n"
-                        f"提交者: {author}\n"
-                        f"提交信息:\n"
-                        f"{message}"
-                    )
+    def _build_commit_notification_message(
+        self,
+        *,
+        repo_name: str,
+        branch: str,
+        sha: str,
+        author: str,
+        message: str,
+        commit_url: str,
+    ) -> str:
+        """构造固定的提交通知文本。"""
+        notification_text = (
+            f"[{repo_name}] 检测到新提交\n"
+            f"分支: {branch}\n"
+            f"Commit: {sha}\n"
+            f"作者: {author}\n"
+            f"说明:\n{message or '(无提交说明)'}"
+        )
+        if commit_url:
+            notification_text += f"\n链接: {commit_url}"
+        return notification_text
 
-                    # 调用生成器 API
-                    # generate_reply 优先使用 chat_stream
-                    success, llm_response = await generator_api.rewrite_reply(
-                        chat_stream=stream,
-                        raw_reply=extra_context,
-                        reason="请根据提交信息用简短、有趣的风格评价一下这个提交。",
-                        enable_chinese_typo=False
-                    )
+    def _build_commentary_intent(
+        self,
+        *,
+        repo_name: str,
+        branch: str,
+        sha: str,
+        author: str,
+        message: str,
+    ) -> str:
+        """构造交给 Maisaka 的主动点评意图。"""
+        return (
+            "请基于刚刚这条 GitHub 提交通知，在当前群里自然接一句简短中文点评。"
+            "不要复述整段通知，不要使用 Markdown，最好控制在 1 句、40 字以内。"
+            f"\n仓库: {repo_name}"
+            f"\n分支: {branch}"
+            f"\nCommit: {sha}"
+            f"\n作者: {author}"
+            f"\n提交说明: {message or '(无提交说明)'}"
+        )
 
-                    if success and llm_response:
-                        # llm_data.content 包含原始生成的文本
-                        ai_comment = llm_response.content
-                        self.logger.info(f"[{self.plugin_name}] 为 {repo_name} 的更新生成了评价: {ai_comment}...")
+    async def _trigger_maisaka_commentary(
+        self,
+        *,
+        stream_id: str,
+        repo_name: str,
+        branch: str,
+        sha: str,
+        author: str,
+        message: str,
+        group_id: str,
+        platform: str,
+    ) -> None:
+        """触发 Maisaka 在当前群里补一句点评。"""
+        intent = self._build_commentary_intent(
+            repo_name=repo_name,
+            branch=branch,
+            sha=sha,
+            author=author,
+            message=message,
+        )
 
-                except Exception as e:
-                    self.logger.error(f"[{self.plugin_name}] AI Generation Failed: {e}")
-                    # 如果生成失败，仅发送基础消息，不中断流程
-                    pass
-            try:
-                if ai_comment != "":
-                    await send_api.text_to_stream(
-                        text=ai_comment,
-                        stream_id=stream.stream_id,
-                        typing=False,
-                        storage_message=True
-                    )
-            except Exception as e:
-                self.logger.error(f"[{self.plugin_name}] 发送消息到群 {group_id} 失败: {e}")
+        try:
+            proactive_result = await self.ctx.maisaka.proactive.trigger(
+                stream_id=stream_id,
+                intent=intent,
+                reason="github_commit_commentary",
+                metadata={
+                    "source": "github_monitor_plugin",
+                    "repo_name": repo_name,
+                    "branch": branch,
+                    "commit_sha": sha,
+                    "author": author,
+                },
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.ctx.logger.error("触发 GitHub 提交点评失败：%s", exc, exc_info=True)
+            return
 
-    def __del__(self):
-        # 插件卸载时取消任务
-        if self.monitor_task:
-            self.monitor_task.cancel()
+        if isinstance(proactive_result, dict) and proactive_result.get("success") is False:
+            self.ctx.logger.warning(
+                "Maisaka 未接受 GitHub 提交点评任务：platform=%s group_id=%s result=%s",
+                platform,
+                group_id,
+                proactive_result,
+            )
+            return
+
+        self.ctx.logger.info("已触发 Maisaka 生成 GitHub 提交点评：[%s] -> %s/%s", repo_name, platform, group_id)
+
+
+def create_plugin() -> GitHubMonitorPlugin:
+    """创建插件实例。"""
+    return GitHubMonitorPlugin()

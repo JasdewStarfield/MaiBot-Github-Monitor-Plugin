@@ -1,10 +1,45 @@
 {
-    "manifest_version": 1,
-    "name": "GitHub 监控插件",
-    "version": "1.0.0",
-    "description": "定期扫描 GitHub 仓库新提交并推送到群聊",
-    "author": {
-        "name": "Jasdew Starfield"
-    },
-    "license": "MIT"
+  "manifest_version": 2,
+  "id": "jasdewstarfield.github-monitor-plugin",
+  "version": "2.0.0",
+  "name": "GitHub 监控插件",
+  "description": "定期扫描 GitHub 仓库的新提交并推送到 MaiBot 群聊",
+  "author": {
+    "name": "Jasdew Starfield",
+    "url": "https://github.com/JasdewStarfield"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/JasdewStarfield/MaiBot-Github-Monitor-Plugin",
+    "homepage": "https://github.com/JasdewStarfield/MaiBot-Github-Monitor-Plugin",
+    "documentation": "https://github.com/Mai-with-u/docs/tree/main/develop/plugin-dev",
+    "issues": "https://github.com/JasdewStarfield/MaiBot-Github-Monitor-Plugin/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.0.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "plugin_type": "integration",
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "bell"
+    }
+  },
+  "capabilities": [
+    "send.text",
+    "chat.get_stream_by_group_id",
+    "llm.generate"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  }
 }
