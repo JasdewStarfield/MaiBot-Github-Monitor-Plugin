@@ -11,6 +11,7 @@ import contextlib
 from typing import Any, ClassVar
 
 import aiohttp
+from pydantic import ConfigDict
 
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Field, MaiBotPlugin, PluginConfigBase
 
@@ -71,6 +72,10 @@ class MonitorSectionConfig(PluginConfigBase):
 
 class GitHubMonitorConfig(PluginConfigBase):
     """插件完整配置。"""
+
+    # 最新 SDK 生成默认 config.toml 时会按字段名导出，因此这里显式允许
+    # `global_` 字段名参与校验，同时保留 `global` 这个别名的兼容能力。
+    model_config = ConfigDict(validate_assignment=True, extra="ignore", populate_by_name=True)
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     global_: GlobalSectionConfig = Field(
@@ -227,7 +232,7 @@ class GitHubMonitorPlugin(MaiBotPlugin):
             "X-GitHub-Api-Version": GITHUB_API_VERSION,
         }
 
-        token = self.config.global_.token.strip()
+        token = self._get_github_token()
         if token:
             headers["Authorization"] = f"Bearer {token}"
 
@@ -301,6 +306,26 @@ class GitHubMonitorPlugin(MaiBotPlugin):
             return "temporary_auth_block"
         return "generic_forbidden"
 
+    def _get_github_token(self) -> str:
+        """尽量从强类型配置和原始配置字典里取回 GitHub Token。"""
+        candidates: list[str] = []
+
+        try:
+            candidates.append(str(self.config.global_.token or "").strip())
+        except Exception:
+            pass
+
+        raw_config = self.get_plugin_config_data()
+        for section_name in ("global_", "global"):
+            section = raw_config.get(section_name)
+            if isinstance(section, dict):
+                candidates.append(str(section.get("token") or "").strip())
+
+        for candidate in candidates:
+            if candidate:
+                return candidate
+        return ""
+
     def _log_github_forbidden(
         self,
         *,
@@ -312,10 +337,13 @@ class GitHubMonitorPlugin(MaiBotPlugin):
     ) -> None:
         """记录 GitHub 403 的详细诊断信息，便于区分限流和权限问题。"""
         reason = self._summarize_github_forbidden(response, error_text)
+        runtime_token = self._get_github_token()
         self.ctx.logger.warning(
             (
                 "GitHub API 访问受限：%s/%s@%s"
                 " reason=%s"
+                " token_present=%s"
+                " token_length=%s"
                 " remaining=%s"
                 " reset=%s"
                 " retry_after=%s"
@@ -327,6 +355,8 @@ class GitHubMonitorPlugin(MaiBotPlugin):
             repo,
             branch,
             reason,
+            bool(runtime_token),
+            len(runtime_token),
             response.headers.get("x-ratelimit-remaining", ""),
             response.headers.get("x-ratelimit-reset", ""),
             response.headers.get("retry-after", ""),
