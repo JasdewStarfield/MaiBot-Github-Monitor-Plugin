@@ -240,11 +240,24 @@ class GitHubMonitorPlugin(MaiBotPlugin):
                     self.ctx.logger.warning("GitHub API 返回了非列表数据：%s/%s", owner, repo)
                     return []
 
-                if response.status == 403:
-                    self.ctx.logger.warning(
-                        "GitHub API 访问受限：%s/%s（可能是速率限制或 Token 权限不足）",
+                if response.status == 401:
+                    error_text = await response.text()
+                    self.ctx.logger.error(
+                        "GitHub API 鉴权失败：%s/%s -> HTTP 401, body=%s",
                         owner,
                         repo,
+                        error_text,
+                    )
+                    return []
+
+                if response.status == 403:
+                    error_text = await response.text()
+                    self._log_github_forbidden(
+                        owner=owner,
+                        repo=repo,
+                        branch=branch,
+                        response=response,
+                        error_text=error_text,
                     )
                     return []
 
@@ -266,6 +279,61 @@ class GitHubMonitorPlugin(MaiBotPlugin):
         except Exception as exc:
             self.ctx.logger.error("获取 GitHub 提交失败：%s/%s -> %s", owner, repo, exc, exc_info=True)
             return []
+
+    @staticmethod
+    def _summarize_github_forbidden(response: aiohttp.ClientResponse, error_text: str) -> str:
+        """根据 403 的响应头和响应体，尽量推断 GitHub 拒绝请求的具体原因。"""
+        lowered_error = error_text.lower()
+        remaining = str(response.headers.get("x-ratelimit-remaining", "")).strip()
+        retry_after = str(response.headers.get("retry-after", "")).strip()
+
+        if remaining == "0":
+            return "primary_rate_limit"
+        if "secondary rate limit" in lowered_error or retry_after:
+            return "secondary_rate_limit"
+        if "resource not accessible by integration" in lowered_error:
+            return "resource_not_accessible"
+        if "bad credentials" in lowered_error:
+            return "bad_credentials"
+        if "saml" in lowered_error or "single sign-on" in lowered_error:
+            return "sso_authorization_required"
+        if "temporarily blocked" in lowered_error or "temporarily rejecting" in lowered_error:
+            return "temporary_auth_block"
+        return "generic_forbidden"
+
+    def _log_github_forbidden(
+        self,
+        *,
+        owner: str,
+        repo: str,
+        branch: str,
+        response: aiohttp.ClientResponse,
+        error_text: str,
+    ) -> None:
+        """记录 GitHub 403 的详细诊断信息，便于区分限流和权限问题。"""
+        reason = self._summarize_github_forbidden(response, error_text)
+        self.ctx.logger.warning(
+            (
+                "GitHub API 访问受限：%s/%s@%s"
+                " reason=%s"
+                " remaining=%s"
+                " reset=%s"
+                " retry_after=%s"
+                " resource=%s"
+                " accepted_permissions=%s"
+                " body=%s"
+            ),
+            owner,
+            repo,
+            branch,
+            reason,
+            response.headers.get("x-ratelimit-remaining", ""),
+            response.headers.get("x-ratelimit-reset", ""),
+            response.headers.get("retry-after", ""),
+            response.headers.get("x-ratelimit-resource", ""),
+            response.headers.get("x-accepted-github-permissions", ""),
+            error_text,
+        )
 
     async def _broadcast_notification(self, commit_item: dict[str, Any], repo_name: str, branch: str) -> None:
         """把新提交广播到所有已配置的订阅群。"""
