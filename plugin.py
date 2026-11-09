@@ -216,9 +216,10 @@ class GitHubMonitorPlugin(MaiBotPlugin):
         self._repo_states[repo_key] = current_latest_sha
         self.ctx.logger.info("%s 检测到 %d 条新提交", repo_key, len(new_commits))
 
-        for commit in reversed(new_commits):
-            await self._broadcast_notification(commit_item=commit, repo_name=repo_name, branch=branch)
-            await asyncio.sleep(1)
+        # 一次轮询内的提交合并广播，仍按旧到新的顺序展示，避免集中推送时刷屏。
+        await self._broadcast_notification(
+            commit_items=list(reversed(new_commits)), repo_name=repo_name, branch=branch
+        )
 
     async def _fetch_latest_commits(self, owner: str, repo: str, branch: str) -> list[dict[str, Any]]:
         """读取指定仓库分支的最新提交列表。"""
@@ -365,27 +366,48 @@ class GitHubMonitorPlugin(MaiBotPlugin):
             error_text,
         )
 
-    async def _broadcast_notification(self, commit_item: dict[str, Any], repo_name: str, branch: str) -> None:
-        """把新提交广播到所有已配置的订阅群。"""
+    async def _broadcast_notification(self, commit_items: list[dict[str, Any]], repo_name: str, branch: str) -> None:
+        """把同一仓库分支本轮的新提交合为一条通知，广播到订阅群。"""
+        if not commit_items:
+            return
+
         subscribers = list(self.config.monitor.subscribers)
         if not subscribers:
             self.ctx.logger.warning("没有配置任何订阅群，跳过本次 GitHub 提交通知")
             return
 
-        sha = str(commit_item.get("sha") or "")[:7]
-        commit_block = commit_item.get("commit") or {}
-        author_block = commit_block.get("author") or {}
-        author = str(author_block.get("name") or "unknown")
-        message = str(commit_block.get("message") or "").strip()
-        commit_url = str(commit_item.get("html_url") or "").strip()
-        base_message = self._build_commit_notification_message(
-            repo_name=repo_name,
-            branch=branch,
-            sha=sha,
-            author=author,
-            message=message,
-            commit_url=commit_url,
-        )
+        # 共用字段提取和空值处理；单条通知继续使用原有模板。
+        details = []
+        for commit_item in commit_items:
+            commit_block = commit_item.get("commit") or {}
+            author_block = commit_block.get("author") or {}
+            details.append({
+                "sha": str(commit_item.get("sha") or "")[:7],
+                "author": str(author_block.get("name") or "unknown"),
+                "message": str(commit_block.get("message") or "").strip(),
+                "commit_url": str(commit_item.get("html_url") or "").strip(),
+            })
+
+        if len(details) == 1:
+            base_message = self._build_commit_notification_message(
+                repo_name=repo_name, branch=branch, **details[0]
+            )
+        else:
+            sections = [f"[{repo_name}] 检测到 {len(details)} 条新提交\n分支: {branch}"]
+            for index, detail in enumerate(details, start=1):
+                section = (
+                    f"{index}. {detail['sha']} | {detail['author']}\n"
+                    f"{detail['message'] or '(无提交说明)'}"
+                )
+                if detail["commit_url"]:
+                    section += f"\n链接: {detail['commit_url']}"
+                sections.append(section)
+            base_message = "\n\n".join(sections)
+
+        # 点评只触发一次，并提供整批提交的上下文，避免只点评其中一条。
+        sha = ", ".join(detail["sha"] for detail in details)
+        author = ", ".join(dict.fromkeys(detail["author"] for detail in details))
+        message = details[0]["message"] if len(details) == 1 else base_message
 
         for subscriber in subscribers:
             group_id = subscriber.group_id.strip()
