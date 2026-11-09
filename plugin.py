@@ -8,16 +8,27 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+from dataclasses import dataclass
 from typing import Any, ClassVar
+from urllib.parse import quote
 
 import aiohttp
-from pydantic import ConfigDict
-
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Field, MaiBotPlugin, PluginConfigBase
+from pydantic import ConfigDict
 
 PLUGIN_CONFIG_VERSION = "2.0.0"
 GITHUB_API_VERSION = "2022-11-28"
 REQUEST_TIMEOUT_SECONDS = 15
+DELIVERY_TIMEOUT_SECONDS = 30
+
+
+@dataclass
+class PendingNotification:
+    """固定本批提交和未成功的群，重试时不会把已发送群再次纳入。"""
+
+    latest_sha: str
+    commits: list[dict[str, Any]]
+    remaining: set[tuple[str, str]]
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -40,6 +51,10 @@ class GlobalSectionConfig(PluginConfigBase):
         json_schema_extra={"placeholder": "ghp_xxx 或 github_pat_xxx"},
     )
     interval: int = Field(default=60, ge=10, description="轮询间隔（秒）")
+    max_message_chars: int = Field(
+        default=2000, ge=512, le=4000,
+        description="通知字符上限（512–4000），超长内容使用标题摘要和完整记录链接",
+    )
     enable_commentary: bool = Field(
         default=True,
         description="是否让 Maisaka 在通知后补一句简短点评",
@@ -100,6 +115,8 @@ class GitHubMonitorPlugin(MaiBotPlugin):
         self._monitor_task: asyncio.Task[None] | None = None
         # 记录每个仓库分支最近一次看到的提交 SHA，避免首次加载时把历史提交全部重发。
         self._repo_states: dict[str, str] = {}
+        # 仅保存当前进程的待发送批次；成功群会立即从 remaining 移除。
+        self._pending_notifications: dict[str, PendingNotification] = {}
 
     async def on_load(self) -> None:
         """插件加载后按当前配置启动后台轮询任务。"""
@@ -165,7 +182,16 @@ class GitHubMonitorPlugin(MaiBotPlugin):
                 continue
 
             for repository in repositories:
-                await self._poll_repository(repository)
+                try:
+                    await self._poll_repository(repository)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # 单仓库的意外错误不能终止整个后台任务。
+                    self.ctx.logger.exception(
+                        "轮询仓库失败，下轮重试：%s/%s@%s",
+                        repository.owner, repository.repo, repository.branch,
+                    )
                 await asyncio.sleep(1)
 
             await asyncio.sleep(interval)
@@ -179,11 +205,16 @@ class GitHubMonitorPlugin(MaiBotPlugin):
         if not owner or not repo_name:
             return
 
+        repo_key = f"{owner}/{repo_name}/{branch}"
+        if repo_key in self._pending_notifications:
+            # 先重试固定批次，避免远端页面变化导致失败通知丢失。
+            await self._deliver_pending(repo_key, owner, repo_name, branch)
+            return
+
         commits = await self._fetch_latest_commits(owner=owner, repo=repo_name, branch=branch)
         if not commits:
             return
 
-        repo_key = f"{owner}/{repo_name}/{branch}"
         current_latest_sha = str(commits[0].get("sha") or "").strip()
         if not current_latest_sha:
             return
@@ -213,20 +244,40 @@ class GitHubMonitorPlugin(MaiBotPlugin):
             self.ctx.logger.warning("%s 的历史基线未命中，本次仅广播最新一条提交", repo_key)
             new_commits = [new_commits[0]]
 
-        self._repo_states[repo_key] = current_latest_sha
         self.ctx.logger.info("%s 检测到 %d 条新提交", repo_key, len(new_commits))
 
         # 一次轮询内的提交合并广播，仍按旧到新的顺序展示，避免集中推送时刷屏。
-        await self._broadcast_notification(
-            commit_items=list(reversed(new_commits)), repo_name=repo_name, branch=branch
+        self._pending_notifications[repo_key] = PendingNotification(
+            latest_sha=current_latest_sha,
+            commits=list(reversed(new_commits)),
+            remaining=self._subscriber_targets(),
         )
+        await self._deliver_pending(repo_key, owner, repo_name, branch)
+
+    def _subscriber_targets(self) -> set[tuple[str, str]]:
+        """规范化并去重订阅目标，同一个群只发送一次。"""
+        return {
+            (subscriber.platform.strip() or "qq", subscriber.group_id.strip())
+            for subscriber in self.config.monitor.subscribers
+            if subscriber.group_id.strip()
+        }
+
+    async def _deliver_pending(self, repo_key: str, owner: str, repo_name: str, branch: str) -> None:
+        """发送或重试本批；全部有效目标完成后才推进仓库基线。"""
+        pending = self._pending_notifications[repo_key]
+        # 热重载移除的群不再重试；新加的群从下一批开始接收。
+        pending.remaining.intersection_update(self._subscriber_targets())
+        await self._broadcast_notification(pending, owner, repo_name, branch)
+        if not pending.remaining:
+            self._repo_states[repo_key] = pending.latest_sha
+            del self._pending_notifications[repo_key]
 
     async def _fetch_latest_commits(self, owner: str, repo: str, branch: str) -> list[dict[str, Any]]:
         """读取指定仓库分支的最新提交列表。"""
         if self._session is None:
             return []
 
-        url = f"https://api.github.com/repos/{owner}/{repo}/commits?sha={branch}"
+        url = f"https://api.github.com/repos/{quote(owner, safe='')}/{quote(repo, safe='')}/commits"
         headers = {
             "Accept": "application/vnd.github+json",
             "User-Agent": "MaiBot-GitHub-Monitor-Plugin",
@@ -238,7 +289,7 @@ class GitHubMonitorPlugin(MaiBotPlugin):
             headers["Authorization"] = f"Bearer {token}"
 
         try:
-            async with self._session.get(url, headers=headers) as response:
+            async with self._session.get(url, headers=headers, params={"sha": branch}) as response:
                 if response.status == 200:
                     payload = await response.json()
                     if isinstance(payload, list):
@@ -366,13 +417,15 @@ class GitHubMonitorPlugin(MaiBotPlugin):
             error_text,
         )
 
-    async def _broadcast_notification(self, commit_items: list[dict[str, Any]], repo_name: str, branch: str) -> None:
+    async def _broadcast_notification(
+        self, pending: PendingNotification, owner: str, repo_name: str, branch: str
+    ) -> None:
         """把同一仓库分支本轮的新提交合为一条通知，广播到订阅群。"""
+        commit_items = pending.commits
         if not commit_items:
             return
 
-        subscribers = list(self.config.monitor.subscribers)
-        if not subscribers:
+        if not pending.remaining:
             self.ctx.logger.warning("没有配置任何订阅群，跳过本次 GitHub 提交通知")
             return
 
@@ -404,51 +457,94 @@ class GitHubMonitorPlugin(MaiBotPlugin):
                 sections.append(section)
             base_message = "\n\n".join(sections)
 
+        base_message = self._limit_notification(base_message, details, owner, repo_name, branch, pending.latest_sha)
+
         # 点评只触发一次，并提供整批提交的上下文，避免只点评其中一条。
         sha = ", ".join(detail["sha"] for detail in details)
         author = ", ".join(dict.fromkeys(detail["author"] for detail in details))
-        message = details[0]["message"] if len(details) == 1 else base_message
+        message = base_message
 
-        for subscriber in subscribers:
-            group_id = subscriber.group_id.strip()
-            platform = subscriber.platform.strip() or "qq"
-            if not group_id:
-                continue
-
-            stream = await self.ctx.chat.get_stream_by_group_id(group_id=group_id, platform=platform)
-            if not stream:
-                self.ctx.logger.warning("未找到订阅群对应的聊天流：platform=%s group_id=%s", platform, group_id)
-                continue
-
-            stream_id = str(stream.get("stream_id") or "").strip()
-            if not stream_id:
-                self.ctx.logger.warning("聊天流缺少 stream_id：platform=%s group_id=%s", platform, group_id)
-                continue
-
-            # 显式把通知写入 Maisaka 历史，这样后续的点评就能直接参考刚发出去的播报内容。
-            sent = await self.ctx.send.text(
-                base_message,
-                stream_id,
-                sync_to_maisaka_history=True,
-                maisaka_source_kind="plugin:github_monitor:notification",
-            )
-            if not sent:
-                self.ctx.logger.error("基础提交通知发送失败：platform=%s group_id=%s", platform, group_id)
-                continue
-
-            self.ctx.logger.info("已推送 GitHub 提交通知：[%s] -> %s/%s", repo_name, platform, group_id)
-
-            if self.config.global_.enable_commentary:
-                await self._trigger_maisaka_commentary(
-                    stream_id=stream_id,
-                    repo_name=repo_name,
-                    branch=branch,
-                    sha=sha,
-                    author=author,
-                    message=message,
-                    group_id=group_id,
-                    platform=platform,
+        for platform, group_id in sorted(pending.remaining):
+            try:
+                # 查找和发送合用一个超时，避免卡住的群阻塞后续仓库。
+                async with asyncio.timeout(DELIVERY_TIMEOUT_SECONDS):
+                    sent, stream_id = await self._send_to_group(base_message, platform, group_id)
+                if not sent:
+                    continue
+                # 必须在点评之前确认成功；点评失败或取消不应重发基础通知。
+                pending.remaining.discard((platform, group_id))
+                if self.config.global_.enable_commentary:
+                    async with asyncio.timeout(DELIVERY_TIMEOUT_SECONDS):
+                        await self._trigger_maisaka_commentary(
+                            stream_id=stream_id, repo_name=repo_name, branch=branch,
+                            sha=sha, author=author, message=message,
+                            group_id=group_id, platform=platform,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                self.ctx.logger.exception(
+                    "通知或点评调用失败：platform=%s group_id=%s；未发送通知将在下轮重试",
+                    platform, group_id,
                 )
+
+    async def _send_to_group(self, message: str, platform: str, group_id: str) -> tuple[bool, str]:
+        """发送单群通知；不可用聊天流和发送失败均保留重试资格。"""
+        stream = await self.ctx.chat.get_stream_by_group_id(group_id=group_id, platform=platform)
+        if not stream:
+            self.ctx.logger.warning("未找到订阅群对应的聊天流：platform=%s group_id=%s", platform, group_id)
+            return False, ""
+
+        stream_id = str(stream.get("stream_id") or "").strip()
+        if not stream_id:
+            self.ctx.logger.warning("聊天流缺少 stream_id：platform=%s group_id=%s", platform, group_id)
+            return False, ""
+
+        # 写入 Maisaka 历史，点评可直接参考刚发送的汇总。
+        sent = await self.ctx.send.text(
+            message, stream_id, sync_to_maisaka_history=True,
+            maisaka_source_kind="plugin:github_monitor:notification",
+        )
+        if not sent:
+            self.ctx.logger.error("基础提交通知发送失败：platform=%s group_id=%s", platform, group_id)
+            return False, stream_id
+        self.ctx.logger.info("已推送 GitHub 提交通知：%s/%s", platform, group_id)
+        return True, stream_id
+
+    def _limit_notification(
+        self, full_text: str, details: list[dict[str, str]], owner: str, repo_name: str, branch: str,
+        latest_sha: str,
+    ) -> str:
+        """短消息保持原样；超长消息预留完整链接，再填充有界的提交标题。"""
+        limit = self.config.global_.max_message_chars
+        if len(full_text) <= limit:
+            return full_text
+
+        def shorten(text: str, size: int) -> str:
+            """截断可变字段并显式标记省略，不截断 URL。"""
+            return text if len(text) <= size else text[:size - 1] + "…"
+
+        # 使用固定批次最后一条提交的 SHA，重试或分支移动时链接仍指向该批历史。
+        url = (
+            f"https://github.com/{quote(owner, safe='')}/{quote(repo_name, safe='')}"
+            f"/commits/{quote(latest_sha, safe='')}"
+        )
+        footer = f"\n内容已压缩，完整记录: {url}"
+        # 异常长的配置字段也不能突破上限，退回可访问的 GitHub 根链接。
+        if len(footer) > limit // 2:
+            footer = "\n内容已压缩，请在 https://github.com 查看仓库提交记录"
+        header = f"[{shorten(repo_name, 60)}] 检测到 {len(details)} 条新提交\n分支: {shorten(branch, 60)}"
+        lines = [header]
+        for index, detail in enumerate(details, start=1):
+            title = (detail["message"] or "(无提交说明)").splitlines()[0]
+            line = f"{index}. {detail['sha']} | {shorten(detail['author'], 30)} | {shorten(title, 120)}"
+            # 始终预留省略计数的空间，即使第一条标题都放不下也可生成有效消息。
+            omitted = f"\n另有 {len(details) - index} 条提交未展示"
+            if len("\n".join(lines)) + 1 + len(line) + len(omitted) + len(footer) > limit:
+                lines.append(f"另有 {len(details) - index + 1} 条提交未展示")
+                break
+            lines.append(line)
+        return "\n".join(lines) + footer
 
     def _build_commit_notification_message(
         self,

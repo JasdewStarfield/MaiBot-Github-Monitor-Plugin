@@ -12,18 +12,29 @@
   "urls": {
     "repository": "https://github.com/JasdewStarfield/MaiBot-Github-Monitor-Plugin",
     "homepage": "https://github.com/JasdewStarfield/MaiBot-Github-Monitor-Plugin",
-    "documentation": "https://github.com/Mai-with-u/docs/tree/main/develop/plugin-dev",
+    "documentation": "https://github.com/JasdewStarfield/MaiBot-Github-Monitor-Plugin#readme",
     "issues": "https://github.com/JasdewStarfield/MaiBot-Github-Monitor-Plugin/issues"
   },
   "host_application": {
-    "min_version": "1.0.0",
-    "max_version": "1.99.99"
+    "min_version": "1.4.3",
+    "max_version": "1.4.99"
   },
   "sdk": {
-    "min_version": "2.0.0",
-    "max_version": "2.99.99"
+    "min_version": "2.22.1",
+    "max_version": "2.22.99"
   },
-  "dependencies": [],
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "aiohttp",
+      "version_spec": ">=3.14.3,<4"
+    },
+    {
+      "type": "python_package",
+      "name": "pydantic",
+      "version_spec": ">=2.11.7,<3"
+    }
+  ],
   "plugin_type": "integration",
   "display": {
     "icon": {
